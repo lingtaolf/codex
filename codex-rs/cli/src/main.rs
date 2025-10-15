@@ -16,6 +16,9 @@ use codex_cli::login::run_logout;
 use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_common::CliConfigOverrides;
 use codex_exec::Cli as ExecCli;
+use codex_exec::Color as ExecColor;
+use codex_exec::ExecCommand;
+use codex_exec::ExecResumeArgs;
 use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_tui::AppExitInfo;
 use codex_tui::Cli as TuiCli;
@@ -117,8 +120,87 @@ struct ResumeCommand {
     #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
     last: bool,
 
+    #[clap(subcommand)]
+    mode: Option<ResumeMode>,
+
     #[clap(flatten)]
     config_overrides: TuiCli,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ResumeMode {
+    /// Resume the session non-interactively and run a single prompt.
+    Exec(ResumeExecArgs),
+}
+
+#[derive(Debug, Parser)]
+struct ResumeExecArgs {
+    /// Prompt to send once the session resumes. If `-` is used, read from stdin.
+    #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
+    prompt: Option<String>,
+
+    /// Optional image(s) to attach to the resumed prompt.
+    #[arg(long = "image", short = 'i', value_name = "FILE", value_delimiter = ',', num_args = 1..)]
+    images: Vec<PathBuf>,
+
+    /// Model the agent should use.
+    #[arg(long, short = 'm')]
+    model: Option<String>,
+
+    #[arg(long = "oss", default_value_t = false)]
+    oss: bool,
+
+    /// Select the sandbox policy to use when executing model-generated shell commands.
+    #[arg(long = "sandbox", short = 's', value_enum)]
+    sandbox_mode: Option<codex_common::SandboxModeCliArg>,
+
+    /// Configuration profile from config.toml to specify default options.
+    #[arg(long = "profile", short = 'p')]
+    config_profile: Option<String>,
+
+    /// Convenience alias for low-friction sandboxed automatic execution (-a on-failure, --sandbox workspace-write).
+    #[arg(long = "full-auto", default_value_t = false)]
+    full_auto: bool,
+
+    /// Skip all confirmation prompts and execute commands without sandboxing.
+    #[arg(
+        long = "dangerously-bypass-approvals-and-sandbox",
+        alias = "yolo",
+        default_value_t = false,
+        conflicts_with = "full_auto"
+    )]
+    dangerously_bypass_approvals_and_sandbox: bool,
+
+    /// Tell the agent to use the specified directory as its working root.
+    #[clap(long = "cd", short = 'C', value_name = "DIR")]
+    cwd: Option<PathBuf>,
+
+    /// Allow running Codex outside a Git repository.
+    #[arg(long = "skip-git-repo-check", default_value_t = false)]
+    skip_git_repo_check: bool,
+
+    /// Path to a JSON Schema file describing the model's final response shape.
+    #[arg(long = "output-schema", value_name = "FILE")]
+    output_schema: Option<PathBuf>,
+
+    #[clap(flatten)]
+    config_overrides: CliConfigOverrides,
+
+    /// Specifies color settings for use in the output.
+    #[arg(long = "color", value_enum, default_value_t = ExecColor::Auto)]
+    color: ExecColor,
+
+    /// Print events to stdout as JSONL.
+    #[arg(long = "json", alias = "experimental-json", default_value_t = false)]
+    json: bool,
+
+    /// Whether to include the plan tool in the conversation.
+    #[arg(long = "include-plan-tool", default_value_t = false)]
+    include_plan_tool: bool,
+
+    /// Specifies file where the last message from the agent should be written.
+    #[arg(long = "output-last-message", short = 'o', value_name = "FILE")]
+    last_message_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -280,20 +362,43 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         Some(Subcommand::AppServer) => {
             codex_app_server::run_main(codex_linux_sandbox_exe, root_config_overrides).await?;
         }
-        Some(Subcommand::Resume(ResumeCommand {
-            session_id,
-            last,
-            config_overrides,
-        })) => {
-            interactive = finalize_resume_interactive(
-                interactive,
-                root_config_overrides.clone(),
+        Some(Subcommand::Resume(resume_command)) => {
+            let ResumeCommand {
                 session_id,
                 last,
+                mode,
                 config_overrides,
-            );
-            let exit_info = codex_tui::run_main(interactive, codex_linux_sandbox_exe).await?;
-            print_exit_messages(exit_info);
+            } = resume_command;
+
+            match mode {
+                Some(ResumeMode::Exec(exec_args)) => {
+                    if session_id.is_none() && !last {
+                        return Err(anyhow::anyhow!(
+                            "Provide a session id or --last when using `codex resume ... exec`."
+                        ));
+                    }
+                    let exec_cli = finalize_resume_exec(
+                        root_config_overrides.clone(),
+                        session_id,
+                        last,
+                        config_overrides,
+                        exec_args,
+                    );
+                    codex_exec::run_main(exec_cli, codex_linux_sandbox_exe).await?;
+                }
+                None => {
+                    interactive = finalize_resume_interactive(
+                        interactive,
+                        root_config_overrides.clone(),
+                        session_id,
+                        last,
+                        config_overrides,
+                    );
+                    let exit_info =
+                        codex_tui::run_main(interactive, codex_linux_sandbox_exe).await?;
+                    print_exit_messages(exit_info);
+                }
+            }
         }
         Some(Subcommand::Login(mut login_cli)) => {
             prepend_config_flags(
@@ -421,6 +526,94 @@ fn finalize_resume_interactive(
     interactive
 }
 
+fn finalize_resume_exec(
+    root_config_overrides: CliConfigOverrides,
+    session_id: Option<String>,
+    last: bool,
+    resume_cli: TuiCli,
+    exec_args: ResumeExecArgs,
+) -> ExecCli {
+    let ResumeExecArgs {
+        prompt: exec_prompt,
+        images: exec_images,
+        model: exec_model,
+        oss: exec_oss,
+        sandbox_mode: exec_sandbox_mode,
+        config_profile: exec_config_profile,
+        full_auto: exec_full_auto,
+        dangerously_bypass_approvals_and_sandbox: exec_dangerously_bypass,
+        cwd: exec_cwd,
+        skip_git_repo_check,
+        output_schema,
+        config_overrides: mut exec_config_overrides,
+        color,
+        json,
+        include_plan_tool,
+        last_message_file,
+    } = exec_args;
+
+    let TuiCli {
+        prompt: fallback_prompt,
+        images: resume_images,
+        resume_picker: _,
+        resume_last: _,
+        resume_session_id: _,
+        model: resume_model,
+        oss: resume_oss,
+        config_profile: resume_config_profile,
+        sandbox_mode: resume_sandbox_mode,
+        approval_policy: _,
+        full_auto: resume_full_auto,
+        dangerously_bypass_approvals_and_sandbox: resume_dangerously_bypass,
+        cwd: resume_cwd,
+        web_search: _,
+        config_overrides: resume_config_overrides,
+    } = resume_cli;
+
+    let images = if !exec_images.is_empty() {
+        exec_images
+    } else {
+        resume_images
+    };
+
+    let model = exec_model.or(resume_model);
+    let config_profile = exec_config_profile.or(resume_config_profile);
+    let sandbox_mode = exec_sandbox_mode.or(resume_sandbox_mode);
+    let oss = exec_oss || resume_oss;
+    let full_auto = exec_full_auto || resume_full_auto;
+    let dangerously_bypass = exec_dangerously_bypass || resume_dangerously_bypass;
+    let cwd = exec_cwd.or(resume_cwd);
+
+    exec_config_overrides
+        .raw_overrides
+        .splice(0..0, resume_config_overrides.raw_overrides);
+    prepend_config_flags(&mut exec_config_overrides, root_config_overrides);
+
+    ExecCli {
+        command: Some(ExecCommand::Resume(ExecResumeArgs {
+            session_id,
+            last,
+            prompt: exec_prompt,
+        })),
+        images,
+        model,
+        oss,
+        sandbox_mode,
+        config_profile,
+        full_auto,
+        dangerously_bypass_approvals_and_sandbox: dangerously_bypass,
+        cwd,
+        skip_git_repo_check,
+        output_schema,
+        config_overrides: exec_config_overrides,
+        color,
+        json,
+        include_plan_tool,
+        last_message_file,
+        prompt: fallback_prompt,
+    }
+}
+
 /// Merge flags provided to `codex resume` so they take precedence over any
 /// root-level flags. Only overrides fields explicitly set on the resume-scoped
 /// CLI. Also appends `-c key=value` overrides with highest precedence.
@@ -489,11 +682,14 @@ mod tests {
         let Subcommand::Resume(ResumeCommand {
             session_id,
             last,
+            mode,
             config_overrides: resume_cli,
         }) = subcommand.expect("resume present")
         else {
             unreachable!()
         };
+
+        assert!(mode.is_none(), "expected interactive resume");
 
         finalize_resume_interactive(interactive, root_overrides, session_id, last, resume_cli)
     }
@@ -560,6 +756,30 @@ mod tests {
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
+    }
+
+    #[test]
+    fn resume_exec_parses_args() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex", "resume", "123", "exec", "--model", "gpt-4o", "hello",
+        ])
+        .expect("parse");
+        let Some(Subcommand::Resume(ResumeCommand {
+            session_id,
+            last,
+            mode,
+            ..
+        })) = cli.subcommand
+        else {
+            panic!("expected resume subcommand");
+        };
+        assert_eq!(session_id.as_deref(), Some("123"));
+        assert!(!last);
+        let Some(ResumeMode::Exec(exec_args)) = mode else {
+            panic!("expected exec mode");
+        };
+        assert_eq!(exec_args.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(exec_args.prompt.as_deref(), Some("hello"));
     }
 
     #[test]
